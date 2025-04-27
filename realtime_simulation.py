@@ -19,6 +19,7 @@ except ImportError:
 import osmnx as ox
 import time
 import networkx as nx # Ensure networkx is imported
+from collections import defaultdict # Import defaultdict
 
 # --- Globals for Animation ---
 # Store artists managed by the update function (lines, text)
@@ -30,13 +31,13 @@ stations_scatter_artist = None # Plot stations once
 
 def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=30, calls_per_minute=3, total_ambulances=25):
     """
-    Pre-calculates simulation states and then animates the results using FuncAnimation.
+    Pre-calculates simulation states, animates the results, and prints/saves a summary.
 
     Args:
         G (nx.MultiDiGraph): The road network graph.
         station_nodes (list): List of graph node IDs representing station locations.
         ems_station_nodes (dict): Dictionary mapping station names/IDs to graph node IDs.
-                                  Used for annotations.
+                                  Used for annotations and summary.
         total_minutes (int): Duration of the simulation in minutes.
         calls_per_minute (int): Average number of new calls per minute.
         total_ambulances (int): Total number of ambulances in the system.
@@ -49,10 +50,8 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
         return
     if not station_nodes:
         print("Warning: station_nodes list is empty.")
-        # Decide if simulation should proceed without stations
-        # return # Or continue with warnings
     if not ems_station_nodes:
-         print("Warning: ems_station_nodes dictionary is empty (needed for annotations).")
+         print("Warning: ems_station_nodes dictionary is empty (needed for annotations/summary).")
     # --- End Input Validation ---
 
     # --- Pre-calculation Phase ---
@@ -62,6 +61,10 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
     demand = {}
     total_calls_to_sample = total_minutes * calls_per_minute + 50 # Pre-sample calls
     origin_pool = sample_origins(G, k=total_calls_to_sample) if G.nodes else list(range(total_calls_to_sample))
+
+    # Initialize structures for summary statistics
+    response_times_per_station = defaultdict(list)
+    final_alloc = {} # Store allocation from the last minute
 
     start_time_calc = time.time()
     for minute in range(total_minutes):
@@ -79,6 +82,7 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
         current_alloc = {}
         current_assignment = {}
         paths = {}
+        tt = {} # Initialize tt for the case where optimization doesn't run
         if active_origins and station_nodes:
             tt, paths = compute_travel_times(G, active_origins, station_nodes)
             current_alloc, current_assignment = optimize_dispatch(
@@ -88,8 +92,23 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
                 tt,
                 total_amb=total_ambulances
             )
+
+            # Accumulate response times for summary
+            for (origin, station_node), assigned in current_assignment.items():
+                if assigned == 1: # If this station is assigned to this origin
+                    travel_time = tt.get((origin, station_node))
+                    if travel_time is not None:
+                        # Assuming travel time is in seconds (adjust if necessary)
+                        response_times_per_station[station_node].append(travel_time)
+                    else:
+                        print(f"Warning: Missing travel time for assigned pair ({origin}, {station_node})")
+
         else:
             print("    No active calls or no stations for optimization.")
+
+        # Store final allocation from the last minute
+        if minute == total_minutes - 1:
+            final_alloc = dict(current_alloc)
 
         # 3. Store state needed for visualization this minute
         minute_state = {
@@ -223,7 +242,76 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
         interval=500 # Milliseconds between frames
     )
 
-    plt.show() # Display the animation window
-    print("[INFO] Animation finished.")
+    plt.show() # Display the animation window (blocks until closed)
+    print("[INFO] Animation window closed.")
     # --- End Animation Phase ---
 
+    # --- Summary Phase ---
+    print("[INFO] Generating simulation summary...")
+    summary_lines = [] # Store lines for printing and file writing
+
+    # Create reverse mapping from node ID to name/idx for easier summary printing
+    node_to_name_map = {v: k for k, v in ems_station_nodes.items()}
+
+    # 1. Per-station response time summary
+    summary_lines.append("\nResponse time summary by station (seconds):")
+    if not response_times_per_station:
+        summary_lines.append("  No calls were assigned during the simulation.")
+    else:
+        for station_node, times in response_times_per_station.items():
+            station_name = node_to_name_map.get(station_node, f"Unknown Node {station_node}")
+            if times: # Ensure list is not empty
+                avg = sum(times) / len(times)
+                mx  = max(times)
+                mn  = min(times)
+                summary_lines.append(f"  Station '{station_name}' (Node {station_node}): served {len(times)} calls, "
+                                     f"min={mn:.1f}s  avg={avg:.1f}s  max={mx:.1f}s")
+            else:
+                 summary_lines.append(f"  Station '{station_name}' (Node {station_node}): served 0 calls")
+
+
+    # 2. Overall response time stats
+    all_times = [t for times in response_times_per_station.values() for t in times]
+    if all_times:
+        overall_avg = sum(all_times) / len(all_times)
+        overall_max = max(all_times)
+        summary_lines.append(f"\nOverall: {len(all_times)} calls served, "
+                             f"average response = {overall_avg:.1f}s, max response = {overall_max:.1f}s")
+    else:
+        summary_lines.append("\nOverall: 0 calls served.")
+
+    # 3. Final ambulance allocation per station
+    summary_lines.append("\nFinal ambulance allocation per station (at end of simulation):")
+    if not final_alloc:
+         summary_lines.append("  No final allocation data available (simulation might have ended early or had no stations).")
+    else:
+        # Use ems_station_nodes to iterate through known stations
+        for name_or_idx, station_node in ems_station_nodes.items():
+            count = final_alloc.get(station_node, 0) # Get count from final allocation, default to 0
+            summary_lines.append(f"  '{name_or_idx}' (Node {station_node}): {count} ambulances")
+        # Check if final_alloc contains nodes not in ems_station_nodes (shouldn't happen if inputs are consistent)
+        allocated_nodes = set(final_alloc.keys())
+        known_nodes = set(ems_station_nodes.values())
+        unknown_nodes = allocated_nodes - known_nodes
+        for node in unknown_nodes:
+             summary_lines.append(f"  'Unknown Node {node}': {final_alloc[node]} ambulances")
+
+
+    # Print summary to console
+    print("\n--- Simulation Summary ---")
+    for line in summary_lines:
+        print(line)
+    print("------------------------")
+
+    # Save summary to file
+    summary_filename = "simulation_summary.txt"
+    try:
+        with open(summary_filename, "w") as f:
+            f.write("--- Simulation Summary ---\n")
+            for line in summary_lines:
+                f.write(line + "\n")
+            f.write("------------------------\n")
+        print(f"[INFO] Summary saved to {summary_filename}")
+    except IOError as e:
+        print(f"[ERROR] Could not write summary to file {summary_filename}: {e}")
+    # --- End Summary Phase ---
