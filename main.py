@@ -14,4 +14,4 @@ if __name__ == "__main__":
     
 
     # Run the real-time simulation
-    run_realtime_simulation(G, station_nodes, ems_stations_nodes, total_minutes=30, calls_per_minute=3,total_ambulances=50)
+    run_realtime_simulation(G, station_nodes, ems_stations_nodes, total_minutes=20, calls_per_minute=3,total_ambulances=50)
