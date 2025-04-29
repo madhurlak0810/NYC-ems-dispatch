@@ -29,6 +29,8 @@ dynamic_plot_artists = []
 origins_scatter_artist = None
 stations_scatter_artist = None
 moving_ambulances = []
+ambulance_scatter_artist = None # Add artist for moving ambulances
+title_artist = None # Artist for the title text
 # --- End Globals ---
 
 def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=30, calls_per_minute=3, total_ambulances=25):
@@ -45,13 +47,15 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
         total_ambulances (int): Total number of ambulances in the system.
     """
     # Reset globals specific to animation state for this run
-    global dynamic_plot_artists, origins_scatter_artist, stations_scatter_artist, served_scatter_artist, moving_ambulances, served_origins
+    global dynamic_plot_artists, origins_scatter_artist, stations_scatter_artist, served_scatter_artist, moving_ambulances, served_origins, ambulance_scatter_artist, title_artist
     dynamic_plot_artists = []
     origins_scatter_artist = None
     stations_scatter_artist = None
     served_scatter_artist = None
     moving_ambulances = []
     served_origins = set() # Reset served origins for animation
+    ambulance_scatter_artist = None
+    title_artist = None
 
     total_seconds = total_minutes * 60
 
@@ -164,11 +168,10 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
         G, show=False, close=False, bgcolor='white', node_size=0,
         edge_color='#cccccc', edge_linewidth=0.5, figsize=(12, 12)
     )
-    ax.set_title("Real-time Ambulance Dispatch Simulation")
 
     def init_animation():
         """Initializes the static parts of the animation plot."""
-        global dynamic_plot_artists, origins_scatter_artist, stations_scatter_artist, served_scatter_artist
+        global dynamic_plot_artists, origins_scatter_artist, stations_scatter_artist, served_scatter_artist, ambulance_scatter_artist, title_artist
         dynamic_plot_artists = [] # Clear artists list
 
         # Plot EMS stations once (static background)
@@ -176,9 +179,10 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
             try:
                 station_xs = [G.nodes[nid]['x'] for nid in station_nodes]
                 station_ys = [G.nodes[nid]['y'] for nid in station_nodes]
-                stations_scatter_artist = ax.scatter(
-                    station_xs, station_ys, c='red', s=80, marker='^',
-                    label='EMS Station', zorder=5
+                # Use plot for legend consistency, scatter doesn't always play nice with FuncAnimation blitting
+                stations_scatter_artist, = ax.plot(
+                    station_xs, station_ys, marker='^', color='red', markersize=10, # Increased size slightly
+                    linestyle='', label='EMS Station', zorder=5
                 )
             except KeyError as e:
                  print(f"Error plotting stations: Node {e} not found in graph.")
@@ -197,18 +201,30 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
             linestyle='', label='Incident (served)', zorder=4
         )
 
+        # Initialize moving ambulance scatter plot (empty at first)
+        ambulance_scatter_artist, = ax.plot(
+            [], [], marker='>', color='darkred', markersize=7, # Slightly larger marker
+            linestyle='', label='Ambulance (moving)', zorder=6
+        )
+
+        # Set title
+        title_artist = ax.set_title("Real-time Simulation (Initializing...)")
+
+        # Create legend based on labeled artists
         ax.legend(loc='upper left')
+
         # Return artists that FuncAnimation should manage
-        # Ensure stations_scatter_artist is included only if it exists
-        base_artists = [origins_scatter_artist, served_scatter_artist]
+        base_artists = [origins_scatter_artist, served_scatter_artist, ambulance_scatter_artist, title_artist]
         if stations_scatter_artist:
             base_artists.append(stations_scatter_artist)
         return base_artists
 
     def update_animation(frame_index):
         """Updates the animation for each frame (second)."""
-        global dynamic_plot_artists, moving_ambulances, served_origins, origins_scatter_artist, served_scatter_artist, stations_scatter_artist
+        global dynamic_plot_artists, moving_ambulances, served_origins, origins_scatter_artist, served_scatter_artist, stations_scatter_artist, ambulance_scatter_artist, title_artist
         if frame_index >= total_seconds:
+            # Optionally set a final title
+            title_artist.set_text(f"Real-time Simulation (Finished at {total_minutes} min)")
             return [] # Stop animation updates
 
         # Determine current minute and second
@@ -234,9 +250,7 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
                             print(f"Warning: Path not found for assigned pair {path_key} in minute {minute_idx+1}. Skipping dispatch.")
                             continue
                         if path_key not in travel_times:
-                             print(f"Warning: Travel time not found for assigned pair {path_key} in minute {minute_idx+1}. Using default 60s.")
-                             # Fallback or skip? Using a default might be misleading. Let's skip.
-                             # travel_time_seconds = 60
+                             print(f"Warning: Travel time not found for assigned pair {path_key} in minute {minute_idx+1}. Skipping dispatch.")
                              continue # Skip dispatch if time is missing
                         else:
                              travel_time_seconds = travel_times[path_key]
@@ -268,7 +282,8 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
                              print(f"Error processing path for {path_key}: {e}. Skipping dispatch.")
 
 
-        # --- Clear dynamic artists from previous frame ---
+        # --- Clear dynamic artists (paths) from previous frame ---
+        # Note: Scatter artists (origins, served, ambulances) are updated via set_data, not removed
         for artist in dynamic_plot_artists:
             artist.remove()
         dynamic_plot_artists.clear()
@@ -298,9 +313,7 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
                 # Ambulance reached destination
                 served_origins.add(amb["origin"]) # Mark origin as served *in the animation*
 
-                # Optionally draw the completed path permanently (or just remove ambulance)
-                # Drawing many permanent paths can clutter the view
-                # Let's draw it temporarily as part of dynamic artists
+                # Draw the completed path temporarily as part of dynamic artists
                 if path_len > 0:
                     full_xs, full_ys = zip(*amb["coords"])
                     full_path_artist, = ax.plot(
@@ -310,6 +323,7 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
                         color='darkgreen',  # darker green to show completed trip
                         alpha=0.7,
                         zorder=2
+                        # No label here
                     )
                     dynamic_plot_artists.append(full_path_artist)
 
@@ -317,15 +331,12 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
 
             # Ambulance is still moving
             # Calculate current position along the path
-            # Ensure path_len > 1 for interpolation, otherwise stay at start/end
             if path_len > 1:
                  progress = elapsed / total_time
-                 # Calculate the index in the coordinate list
-                 # Ensure index stays within bounds [0, path_len - 1]
                  idx = min(max(0, int(progress * (path_len - 1))), path_len - 1)
             elif path_len == 1:
                  idx = 0 # If path has only one node, stay there
-            else: # path_len == 0 already handled, but for completeness
+            else:
                  continue # Should not happen
 
 
@@ -335,7 +346,6 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
 
             # --- Plot partial path up to current point ---
             if idx >= 0 and path_len > 0: # Need at least one point to plot path start
-                # Plot from start up to index `idx` (inclusive)
                 path_xs, path_ys = zip(*amb["coords"][:idx+1])
                 line_artist, = ax.plot(
                     path_xs, path_ys,
@@ -344,6 +354,7 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
                     color='green',  # lighter green during movement
                     alpha=0.5,
                     zorder=3
+                    # No label here
                 )
                 dynamic_plot_artists.append(line_artist)
 
@@ -352,27 +363,16 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
         # Update the list of moving ambulances
         moving_ambulances = ambulances_to_keep
 
-        # --- Plot current ambulance positions ---
+        # --- Update current ambulance positions ---
         if active_x and active_y:
-            # Use scatter for current positions
-            # Note: Label might duplicate in legend if not handled carefully.
-            # Consider creating amb_artist once in init and using set_data if legend is an issue.
-            amb_artist = ax.scatter(
-                active_x, active_y,
-                marker='>', # Use a directional marker like triangle
-                color='darkred', # Make ambulances distinct
-                s=50,        # Size
-                label='Ambulance (moving)', # More specific label
-                zorder=6     # Ensure ambulances are on top
-            )
-            dynamic_plot_artists.append(amb_artist)
+            ambulance_scatter_artist.set_data(active_x, active_y)
+        else:
+            ambulance_scatter_artist.set_data([], []) # Clear if no ambulances moving
 
         # --- Update incident markers (served/unserved) ---
-        # Get the set of all origins that should be visible (appeared up to this minute)
         current_state = simulation_history[min(minute_idx, len(simulation_history) - 1)]
         origins_to_display = set(current_state["active_origins"])
 
-        # Split into unserved and served based on the animation's served_origins set
         unserved_display = [o for o in origins_to_display if o not in served_origins]
         served_display = [o for o in origins_to_display if o in served_origins]
 
@@ -400,12 +400,12 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
             print(f"Error updating served incidents: Node {e} not found.")
             served_scatter_artist.set_data([], []) # Clear on error
 
-
-        ax.set_title(f"Real-time Simulation (Minute {minute_idx+1}, Second {second_in_min})")
+        # Update title text
+        title_artist.set_text(f"Real-time Simulation (Minute {minute_idx+1}, Second {second_in_min})")
 
         # --- Return all artists that were modified ---
-        # Base artists + dynamic ones created in this frame
-        base_artists = [origins_scatter_artist, served_scatter_artist]
+        # Base artists (updated via set_data) + dynamic path artists
+        base_artists = [origins_scatter_artist, served_scatter_artist, ambulance_scatter_artist, title_artist]
         if stations_scatter_artist: # Include static stations if they exist
              base_artists.append(stations_scatter_artist)
         return base_artists + dynamic_plot_artists
@@ -417,7 +417,7 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
         update_animation,
         frames=total_seconds, # Iterate through each second
         init_func=init_animation,
-        blit=True, # Use blitting for potential performance improvement
+        blit=False, # Use blitting for potential performance improvement
                    # Set to False if experiencing rendering issues/artifacts
         repeat=False,
         interval=50 # Milliseconds between frames (e.g., 50ms = 20fps) - adjust for desired speed
