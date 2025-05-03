@@ -266,7 +266,7 @@ def run_realtime_simulation(G, station_nodes, ems_station_nodes, total_minutes=3
                             if not path:
                                 print(f"Warning: Empty path for {path_key}. Skipping dispatch.")
                                 continue
-                            coords = [(G.nodes[n]['x'], G.nodes[n]['y']) for n in path]
+                            coords = [(G.nodes[n]['x'], G.nodes[n]['y']) for n in reversed(path)]
 
                             moving_ambulances.append({
                                 "origin": origin,
