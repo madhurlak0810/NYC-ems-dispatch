@@ -48,7 +48,7 @@ def run_realtime_simulation(city_graph, station_nodes, ems_station_nodes, total_
 
     # Currently we randomly generate number of ambulances for each station.
     # TODO Make it an argument passed into this function.
-    final_alloc             = {station: random.randint(1, 10) for station in station_nodes}
+    final_alloc             = {station: random.randint(6, 30) for station in station_nodes}
     # final_alloc             = {station: 2 for station in station_nodes}
     idle_ambs               = final_alloc.copy()
     unused_ambs             = idle_ambs.copy()
@@ -658,12 +658,14 @@ def fetch_nyc_graph() -> nx.MultiDiGraph:
         # 2) Project to a local metric CRS (NYLongIsland / EPSG:2263)
         city_graph = ox.project_graph(city_graph, to_crs="EPSG:2263")
 
-        # 3) Compute a default travel_time attribute on every edge (30 mph ≈ 44 ft/s)
-        default_speed_fps = 30 * 5280 / 3600
+        # 3) Compute a default travel_time attribute on every edge (30 mph ≈ 13.41 m/s)
+        default_speed_mps = 10 # 10 m/s = 22.37 mph
+
         for u, v, k, data in city_graph.edges(keys=True, data=True):
-            length = data.get("length", 0)             # in feet
-            speed  = data.get("maxspeed_fps", default_speed_fps)
+            length = data.get("length", 0) # convert to meters
+            speed  = data.get("maxspeed_mps", default_speed_mps)
             data["travel_time"] = (length / speed) if speed > 0 else float("inf")
+
 
         print(f"Cache saving to file \"{cache_file}\"...")
         cache_object(city_graph, cache_file)
@@ -708,66 +710,86 @@ def compute_travel_times(city_graph, origins, stations):
 
     return total_time, paths, time_progress
 
-def optimize_dispatch(origins, stations, demand, total_time, idle_ambs, max_time=600):
+def optimize_dispatch(origins, stations, demand, total_time, idle_ambs, max_time=600000):
     print("--------------------------------------------------")
-    print("idle_ambs")
+    print("[INFO] Idle ambulances by station:")
     for station in stations:
-        print(station, idle_ambs[station])
+        print(f"{station}: {idle_ambs[station]}")
     print("--------------------------------------------------")
 
-    valid     = [(origin, station) for origin in origins for station in stations if total_time[(origin, station)] <= max_time]
-    prob      = pulp.LpProblem('NYC_Ambulance', pulp.LpMinimize)
-    assign    = pulp.LpVariable.dicts('asgn', valid, cat='Binary')
+    # Step 1: Generate valid origin-station pairs within max time
+    valid = [
+        (origin, station) 
+        for origin in origins 
+        for station in stations 
+        if total_time.get((origin, station), float('inf')) <= max_time
+    ]
 
-    upBound = max([idle_ambs[station] for station in idle_ambs])
-    print(f"upBound: {upBound}")
-    print(f"len(demand): {len(demand)}")
-    amb_count = pulp.LpVariable.dicts('amb', stations, lowBound=0, upBound=upBound, cat='Integer')
+    if not valid:
+        print("[ERROR] No valid origin-station pairs found. Check max_time or total_time.")
+        return None, None
 
-    # objective
-    prob += pulp.lpSum(demand[origin] * total_time[origin, station] * assign[(origin, station)] for (origin, station) in valid)
+    # Step 2: Problem definition
+    prob = pulp.LpProblem('NYC_Ambulance_Dispatch', pulp.LpMinimize)
 
-    # total ambulances
-    # prob += pulp.lpSum(amb_count[station] for station in stations) == len(demand)
+    # Step 3: Variable definitions
+    assign = pulp.LpVariable.dicts('assign', valid, cat='Binary')
+    amb_count = pulp.LpVariable.dicts('ambulance_count', stations, lowBound=0, upBound=max(idle_ambs.values()), cat='Integer')
+
+    # Step 4: Objective function - Minimize weighted travel time
+    prob += pulp.lpSum(demand[origin] * total_time[(origin, station)] * assign[(origin, station)] for (origin, station) in valid)
+
+    # Step 5: Constraints
+    ## Total ambulances dispatched should be at least 50% of demand
     prob += pulp.lpSum(amb_count[station] for station in stations) >= len(demand) * 0.5
 
-    # each origin must be served by => 1 ambulance
+    ## Each origin must be served by exactly 1 ambulance
     for origin in origins:
-        vs = [s for (oo, s) in valid if oo==origin]
+        vs = [s for (oo, s) in valid if oo == origin]
         if vs:
             prob += pulp.lpSum(assign[(origin, station)] for station in vs) == 1
 
-    # For every station, number of dispatched ambulances must <= number of available ambulances
+    ## Ambulances dispatched from each station must not exceed idle capacity
     for station in stations:
         prob += amb_count[station] <= idle_ambs[station]
 
-    # Sum of the dispatched ambulances from station s must == number of dispatched ambulances from this station s
+    ## Sum of assignments to a station must match the ambulance count from that station
     for station in stations:
         prob += pulp.lpSum(assign[(origin, station)] for (origin, s) in valid if s == station) == amb_count[station]
 
-    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    # Step 6: Solve the problem
+    prob.solve(pulp.PULP_CBC_CMD(msg=True))
 
+    # Step 7: Solver Status
+    if pulp.LpStatus[prob.status] != "Optimal":
+        print(f"[ERROR] Optimization failed. Solver Status: {pulp.LpStatus[prob.status]}")
+        return None, None
+
+    print("[INFO] Optimization successful!")
     print("==================================================")
-    print("Status:", pulp.LpStatus[prob.status])
-    for v in prob.variables():
-        print(v.name, "=", v.varValue)
+    print("Station | Allocated | Remaining")
+    print("--------------------------------------------------")
 
-    # If LpStatus is not optimal, the optimization is unsolvable.
-    # Check if there's too many demands but not enough ambulances?
-    assert(pulp.LpStatus[prob.status] == "Optimal")
+    # Step 8: Output allocations and assignments
+    current_alloc = {}
+    current_assignment = {}
+
+    for station in stations:
+        allocated = int(amb_count[station].varValue)
+        remaining = idle_ambs[station] - allocated
+        current_alloc[station] = allocated
+        print(f"{station} | {allocated} | {remaining}")
 
     print("--------------------------------------------------")
-    print("station alloc remaining")
-    for station in stations:
-        print(station, int(amb_count[station].varValue), idle_ambs[station] - int(amb_count[station].varValue))
+    print("[INFO] Assignment Details:")
+    for (origin, station) in valid:
+        assigned = int(assign[(origin, station)].varValue)
+        if assigned > 0:
+            print(f"{origin} -> {station} | Assigned: {assigned}")
+        current_assignment[(origin, station)] = assigned
+
     print("==================================================")
 
-    for station in stations:
-        assert(int(amb_count[station].varValue) <= idle_ambs[station])
-
-    # (current_alloc, current_assignment)
-    current_alloc      = {station:int(amb_count[station].varValue) for station in stations}
-    current_assignment = {(origin, station):int(assign[(origin, station)].varValue) for (origin, station) in valid}
     return current_alloc, current_assignment
 
 # Revised fetch_ems_stations
