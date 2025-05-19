@@ -35,9 +35,9 @@ This project simulates real-time ambulance dispatching within a specified urban 
 
 ## Usage
 
-1.  **Run the main simulation script:**
+1.  **Run the update simulation script:**
     ```bash
-    python main.py
+    python update.py
     ```
 
 2.  **Observe the output:**
@@ -53,7 +53,7 @@ This project simulates real-time ambulance dispatching within a specified urban 
 *   `realtime_simulation.py`: Contains the logic for running the simulation step-by-step, pre-calculating states, managing the Matplotlib animation, and generating the final summary.
 *   `requirements.txt`: Lists the required Python packages.
 *   `README.md`: This file.
-
+*   `update.py`: updated version of main (#TODO have to split into main ambulance_network and realtime_simulation)
 ## Dependencies
 
 Key Python libraries used:

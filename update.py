@@ -48,7 +48,7 @@ def run_realtime_simulation(city_graph, station_nodes, ems_station_nodes, total_
 
     # Currently we randomly generate number of ambulances for each station.
     # TODO Make it an argument passed into this function.
-    final_alloc             = {station: random.randint(1, 10) for station in station_nodes}
+    final_alloc             = {station: random.randint(7, 45) for station in station_nodes}
     # final_alloc             = {station: 2 for station in station_nodes}
     idle_ambs               = final_alloc.copy()
     unused_ambs             = idle_ambs.copy()
