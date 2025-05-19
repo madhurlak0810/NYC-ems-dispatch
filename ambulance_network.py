@@ -18,10 +18,10 @@ def fetch_nyc_graph() -> nx.MultiDiGraph:
     # 2) Project to a local metric CRS (NYLongIsland / EPSG:2263)
     G = ox.project_graph(G, to_crs="EPSG:2263")
     
-    # 3) Compute a default travel_time attribute on every edge (30 mph ≈ 44 ft/s)
-    default_speed_fps = 30 * 5280 / 3600
+    # 3) Compute a default travel_time attribute on every edge (10 m/s)
+    default_speed_fps = 10
     for u, v, k, data in G.edges(keys=True, data=True):
-        length = data.get("length", 0)             # in feet
+        length = data.get("length", 0)             # in meters
         speed  = data.get("maxspeed_fps", default_speed_fps)
         data["travel_time"] = (length / speed) if speed > 0 else float("inf")
     
