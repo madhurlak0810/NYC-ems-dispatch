@@ -31,6 +31,7 @@ This project simulates real-time ambulance dispatching within a specified urban 
     ```bash
     pip install -r requirements.txt
     ```
+    *Note: install tkinter for your respective system.*
     *Note: Depending on your system, installing `geopandas` and its dependencies (like `GDAL`, `pyproj`) might require additional system libraries. Refer to the [geopandas installation guide](https://geopandas.org/en/stable/getting_started/install.html) if you encounter issues.*
 
 ## Usage
@@ -54,6 +55,7 @@ This project simulates real-time ambulance dispatching within a specified urban 
 *   `requirements.txt`: Lists the required Python packages.
 *   `README.md`: This file.
 *   `update.py`: updated version of main (#TODO have to split into main ambulance_network and realtime_simulation)
+*   `initial_solution.py`: naive approach of the EMS dispatch on a synthetic map.
 ## Dependencies
 
 Key Python libraries used:
