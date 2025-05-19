@@ -6,270 +6,177 @@ import matplotlib.pyplot as plt
 import geopandas as gpd
 from shapely.geometry import Point
 from shapely.geometry import box
-from dotenv import load_dotenv
-import googlemaps
-from typing import List, Tuple, Dict, Optional
-import os
-from pyproj import Transformer
-from math import radians, sin, cos, sqrt, atan2
 
-load_dotenv()  # Load environment variables from .env file
-API_KEY=os.getenv("API_KEY")  # Make sure to replace this with your actual API key
-gmaps = googlemaps.Client(key=API_KEY)
-
-import osmnx as ox
-import networkx as nx
-
-# Initialize the transformer from EPSG:2263 to WGS84
-transformer = Transformer.from_crs("EPSG:2263", "EPSG:4326", always_xy=True)
-def fetch_nyc_graph(place_name="Manhattan, New York City, New York, USA") -> tuple[nx.MultiDiGraph, dict]:
+def fetch_nyc_graph() -> nx.MultiDiGraph:
     """
-    Fetches and processes a road network graph for all of New York City 
-    and returns its bounding box.
-    
-    Returns:
-        - G (nx.MultiDiGraph): The processed road network graph.
-        - bounding_box (dict): The bounding box of the graph in the format:
-            {
-                'min_x': float,
-                'min_y': float,
-                'max_x': float,
-                'max_y': float
-            }
+    Fetches and processes a road network graph for all of New York City.
     """
+    # 1) Grab the full NYC driving network by name
+    place_name = "New York City, New York, USA"
     G = ox.graph_from_place(place_name, network_type="drive")
     
     # 2) Project to a local metric CRS (NYLongIsland / EPSG:2263)
-    G = ox.project_graph(G, to_crs="EPSG:4326")
+    G = ox.project_graph(G, to_crs="EPSG:2263")
     
-    # 3) Assign default travel time to each edge
-    default_speed_fps = 10
+    # 3) Compute a default travel_time attribute on every edge (30 mph ≈ 44 ft/s)
+    default_speed_fps = 30 * 5280 / 3600
     for u, v, k, data in G.edges(keys=True, data=True):
         length = data.get("length", 0)             # in feet
         speed  = data.get("maxspeed_fps", default_speed_fps)
         data["travel_time"] = (length / speed) if speed > 0 else float("inf")
     
-    return G,place_name
+    return G
 
-
-def sample_origins(city_graph, k=5):
-    nodes = list(city_graph.nodes())
+def sample_origins(G, k=50):
+    nodes = list(G.nodes())
     random.seed(42)
     return random.sample(nodes, k)
 
-def compute_travel_times(city_graph, origins, stations):
-    total_time = {}
-    paths      = {}
-    time_progress = {}
+def compute_travel_times(G, origins, stations):
+    tt = {}
+    paths = {}
+    for o in origins:
+        lengths, pathdict = nx.single_source_dijkstra(G, o, weight='travel_time')
+        for s in stations:
+            tt[(o,s)] = lengths.get(s, float('inf'))
+            if s in pathdict:
+                paths[(o,s)] = pathdict[s]
+    return tt, paths
 
-    for origin in origins:
-        # Compute shortest path lengths and paths from origin to all nodes
-        lengths, pathdict = nx.single_source_dijkstra(city_graph, origin, weight='travel_time')
-
-        for station in stations:
-            # Get total travel time from origin to station (or inf if unreachable)
-            total_time[(origin, station)] = lengths.get(station, float('inf'))
-
-            if station in pathdict:
-                path = pathdict[station]
-                paths[(origin, station)] = path
-
-                # Compute cumulative travel times along the path
-                cumulative = [0]
-                for i in range(1, len(path)):
-                    edge_data = city_graph[path[i - 1]][path[i]]
-
-                    # For MultiDiGraph, pick the shortest edge if multiple
-                    min_time = min(d.get('travel_time', float('inf')) for d in edge_data.values())
-
-                    cumulative.append(cumulative[-1] + min_time)
-
-                time_progress[(origin, station)] = cumulative
-
-    return total_time, paths, time_progress
-
-def optimize_dispatch(origins, stations, demand, total_time, idle_ambs, max_time=600000):
-    print("--------------------------------------------------")
-    print("[INFO] Idle ambulances by station:")
-    for station in stations:
-        print(f"{station}: {idle_ambs[station]}")
-    print("--------------------------------------------------")
-
-    # Step 1: Generate valid origin-station pairs within max time
-    valid = [
-        (origin, station) 
-        for origin in origins 
-        for station in stations 
-        if total_time.get((origin, station), float('inf')) <= max_time
-    ]
-
-    if not valid:
-        print("[ERROR] No valid origin-station pairs found. Check max_time or total_time.")
-        return None, None
-
-    # Step 2: Problem definition
-    prob = pulp.LpProblem('NYC_Ambulance_Dispatch', pulp.LpMinimize)
-
-    # Step 3: Variable definitions
-    assign = pulp.LpVariable.dicts('assign', valid, cat='Binary')
-    amb_count = pulp.LpVariable.dicts('ambulance_count', stations, lowBound=0, upBound=max(idle_ambs.values()), cat='Integer')
-
-    # Step 4: Objective function - Minimize weighted travel time
-    prob += pulp.lpSum(demand[origin] * total_time[(origin, station)] * assign[(origin, station)] for (origin, station) in valid)
-
-    # Step 5: Constraints
-    ## Total ambulances dispatched should be at least 50% of demand
-    prob += pulp.lpSum(amb_count[station] for station in stations) >= len(demand) * 0.5
-
-    ## Each origin must be served by exactly 1 ambulance
-    for origin in origins:
-        vs = [s for (oo, s) in valid if oo == origin]
+def optimize_dispatch(origins, stations, demand, tt, total_amb=5, max_t=600):
+    valid = [(o,s) for o in origins for s in stations if tt[(o,s)] <= max_t]
+    prob = pulp.LpProblem('NYC_Ambulance', pulp.LpMinimize)
+    amb_count = pulp.LpVariable.dicts('amb', stations, lowBound=0, upBound=total_amb, cat='Integer')
+    assign = pulp.LpVariable.dicts('asgn', valid, cat='Binary')
+    # objective
+    prob += pulp.lpSum(demand[o] * tt[o,s] * assign[(o,s)] for (o,s) in valid)
+    # total ambulances
+    prob += pulp.lpSum(amb_count[s] for s in stations) == total_amb
+    # each origin must be served by ≥1 ambulance
+    for o in origins:
+        vs = [s for (oo,s) in valid if oo==o]
         if vs:
-            prob += pulp.lpSum(assign[(origin, station)] for station in vs) == 1
-
-    ## Ambulances dispatched from each station must not exceed idle capacity
-    for station in stations:
-        prob += amb_count[station] <= idle_ambs[station]
-
-    ## Sum of assignments to a station must match the ambulance count from that station
-    for station in stations:
-        prob += pulp.lpSum(assign[(origin, station)] for (origin, s) in valid if s == station) == amb_count[station]
-
-    # Step 6: Solve the problem
-    prob.solve(pulp.PULP_CBC_CMD(msg=True))
-
-    # Step 7: Solver Status
-    if pulp.LpStatus[prob.status] != "Optimal":
-        print(f"[ERROR] Optimization failed. Solver Status: {pulp.LpStatus[prob.status]}")
-        return None, None
-
-    print("[INFO] Optimization successful!")
-    print("==================================================")
-    print("Station | Allocated | Remaining")
-    print("--------------------------------------------------")
-
-    # Step 8: Output allocations and assignments
-    current_alloc = {}
-    current_assignment = {}
-
-    for station in stations:
-        allocated = int(amb_count[station].varValue)
-        remaining = idle_ambs[station] - allocated
-        current_alloc[station] = allocated
-        print(f"{station} | {allocated} | {remaining}")
-
-    print("--------------------------------------------------")
-    print("[INFO] Assignment Details:")
-    for (origin, station) in valid:
-        assigned = int(assign[(origin, station)].varValue)
-        if assigned > 0:
-            print(f"{origin} -> {station} | Assigned: {assigned}")
-        current_assignment[(origin, station)] = assigned
-
-    print("==================================================")
-
-    return current_alloc, current_assignment
+            prob += pulp.lpSum(assign[(o,s)] for s in vs) >= 1
+    # can't assign from a station with no ambulance
+    for (o,s) in valid:
+        prob += assign[(o,s)] <= amb_count[s]
+    prob.solve(pulp.PULP_CBC_CMD(msg=False))
+    return {s:int(amb_count[s].varValue) for s in stations}, {(o,s):int(assign[(o,s)].varValue) for (o,s) in valid}
 
 
-def haversine_distance(lat1, lon1, lat2, lon2):
+# --- Revised fetch_ems_stations ---
+def fetch_ems_stations(G: nx.MultiDiGraph) -> gpd.GeoDataFrame:
     """
-    Calculates the great-circle distance between two points 
-    on the Earth specified in decimal degrees using the Haversine formula.
-    """
-    R = 6371000  # Radius of Earth in meters
+    Queries OSM for EMS (ambulance) stations within the bounding box of G
+    and returns a GeoDataFrame of their geometries.
 
-    dlat = radians(lat2 - lat1)
-    dlon = radians(lon2 - lon1)
-
-    a = sin(dlat / 2)**2 + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2)**2
-    c = 2 * atan2(sqrt(a), sqrt(1 - a))
-
-    return R * c
-
-def fetch_ems_stations(place_name: str) -> List[Tuple[float, float, str]]:
-    """
-    Fetches the geographic coordinates and names of EMS stations near a given place
-    using the Google Maps Places API.
-
-    Args:
-        place_name (str): The name of the place to search for EMS stations.
+    Parameters:
+        G (nx.MultiDiGraph): A projected or unprojected graph with CRS and optional 'bbox'.
+                             If G.graph['bbox'] is missing, it will be computed from node extents.
 
     Returns:
-        List[Tuple[float, float, str]]: A list of (latitude, longitude, name) tuples
-                                        representing the EMS stations.
-                                        Returns an empty list on error.
+        gpd.GeoDataFrame: EMS station features (Point or Polygon) projected to G's CRS.
+                          Returns an empty GeoDataFrame if none are found or on error.
     """
+    print("[INFO] Fetching EMS station locations from OSM...")
+    # Ensure CRS is defined
+    if 'crs' not in G.graph:
+        raise ValueError("Graph G must have a 'crs' attribute defined in G.graph['crs']")
+
+    # Get or compute bbox in lat/lon (EPSG:4326)
     try:
-        # Search for EMS stations with a text query
-        response = gmaps.places(
-            query=f"EMS Station in {place_name}"
-        )
-        
-        print("[DEBUG] Google Maps Response:", response)  # DEBUG
-        
-        if not response or 'results' not in response:
-            print(f"Error: Invalid response from Places API for EMS stations in {place_name}")
-            return []
+        if 'bbox' in G.graph:
+             # Assuming stored bbox is (west, south, east, north) in EPSG:4326
+             west, south, east, north = G.graph['bbox']
+             print(f"[INFO] Using stored bbox (EPSG:4326): W={west}, S={south}, E={east}, N={north}")
+        else:
+            print("[WARN] Graph 'bbox' attribute missing. Calculating from node bounds.")
+            # Ensure nodes are in Lat/Lon for bbox calculation if graph isn't already
+            if G.graph['crs'].to_epsg() != 4326:
+                 gdf_nodes = ox.graph_to_gdfs(G, edges=False).to_crs(epsg=4326)
+            else:
+                 gdf_nodes = ox.graph_to_gdfs(G, edges=False)
+            west, south, east, north = gdf_nodes.total_bounds  # lon/lat
+            G.graph['bbox'] = (west, south, east, north) # Store for future use
+            print(f"[INFO] Calculated bbox (EPSG:4326): W={west}, S={south}, E={east}, N={north}")
 
-        ems_stations = []
-        for result in response.get('results', []):
-            station_lat = result['geometry']['location']['lat']
-            station_lng = result['geometry']['location']['lng']
-            station_name = result.get('name', 'Unnamed Station')
-            ems_stations.append((station_lat, station_lng, station_name))
+        # Define EMS tag
+        tags = {"emergency": "ambulance_station"}
 
-        print(f"[INFO] Found {len(ems_stations)} EMS stations.")
-        return ems_stations
+        # Query OSM for ambulance_station features using the correct bbox order for geometries_from_bbox
+        gdf = ox.features_from_bbox(G.graph['bbox'],tags)
+        print(f"[INFO] Found {len(gdf)} raw features matching tags.")
+
+        # Keep only points/polygons/multipolygons
+        gdf = gdf[gdf.geometry.type.isin(['Point', 'Polygon', 'MultiPolygon'])]
+        print(f"[INFO] {len(gdf)} Point/Polygon/MultiPolygon features remaining.")
+
+        if gdf.empty:
+            print("[WARN] No suitable EMS station features found.")
+            return gdf # Return empty GeoDataFrame
+
+        # Project to graph CRS
+        print(f"[INFO] Projecting features to graph CRS: {G.graph['crs']}")
+        gdf = gdf.to_crs(G.graph['crs'])
+
+        return gdf
 
     except Exception as e:
-        print(f"Error fetching EMS stations: {e}")
-        return []
+        print(f"[ERROR] Failed to fetch or process EMS stations: {e}")
+        # Return an empty GeoDataFrame with the expected CRS to avoid downstream errors
+        return gpd.GeoDataFrame(geometry=[], crs=G.graph['crs'])
 
 
-def add_ems_stations_to_graph(G: nx.MultiDiGraph, place_name) -> tuple[nx.MultiDiGraph, list, list]:
+# --- Revised snap_ems_to_nodes ---
+# Changed return type hint and added name handling
+def snap_ems_to_nodes(G: nx.MultiDiGraph, gdf_ems: gpd.GeoDataFrame) -> dict[str | int, int]:
     """
-    Fetches EMS stations using Google Maps and adds them as nodes to the graph.
+    Snaps EMS station geometries from a GeoDataFrame to the nearest nodes in G.
 
-    Args:
-        G (nx.MultiDiGraph): The graph to add the EMS stations to.
-        place_name (str): The name of the place to search for EMS stations.
+    Parameters:
+        G (nx.MultiDiGraph): Projected graph with node coordinates.
+        gdf_ems (gpd.GeoDataFrame): EMS station features in G's CRS.
 
     Returns:
-        tuple: A tuple containing:
-            - nx.MultiDiGraph: The updated graph with the EMS stations added as nodes.
-            - list: List of EMS stations with their coordinates.
-            - list: List of added EMS station node IDs.
+        dict[str | int, int]: Mapping of station name (if available, otherwise OSM index)
+                              to the nearest graph node ID.
     """
-    station_nodes = []
-    ems_stations = fetch_ems_stations(place_name)
-    print(f"[INFO] Found {len(ems_stations)} EMS stations.")
+    print(f"[INFO] Snapping {len(gdf_ems)} EMS stations to graph nodes...")
+    station_nodes = {}
+    processed_names = set() # To handle potential duplicate names
 
-    for station_lat, station_lng, station_name in ems_stations:
-        # Find the nearest node in the graph
-        nearest_node = None
-        min_distance = float('inf')
-        for node_id in G.nodes():
-            node_lat = G.nodes[node_id]['y']
-            node_lng = G.nodes[node_id]['x']
-            distance = (node_lat - station_lat) ** 2 + (node_lng - station_lng) ** 2
-            if distance < min_distance:
-                min_distance = distance
-                nearest_node = node_id
-        print(f"[DEBUG] Nearest node for {station_name}: {nearest_node} with distance {min_distance:.4f}")
-        # Only add if a nearest node is found
-        if nearest_node is not None and min_distance != float('inf'):
-            # Add the EMS station as a node, with a unique identifier
-            ems_node_id = f"ems_{station_name.replace(' ', '_')}_{nearest_node}"  # Ensure unique ID
-            if ems_node_id not in G.nodes:
-                G.add_node(ems_node_id, y=station_lat, x=station_lng, name=station_name, type='ems_station')
-                # Create edges connecting the EMS station to the nearest node
-                G.add_edge(ems_node_id, nearest_node, weight=min_distance**0.5, type='to_graph')
-                G.add_edge(nearest_node, ems_node_id, weight=min_distance**0.5, type='to_graph')
-                print(f"[INFO] Added EMS station '{station_name}' at ({station_lat:.4f}, {station_lng:.4f}) and connected it to node {nearest_node}.")
-                station_nodes.append(ems_node_id)
-            else:
-                print(f"[INFO] EMS station with id '{ems_node_id}' already exists.")
+    if gdf_ems.empty:
+        print("[WARN] GeoDataFrame for snapping is empty.")
+        return {}
+
+    for idx, row in gdf_ems.iterrows():
+        # Use station name if available and valid, otherwise use OSM index as key
+        station_key = row.get('name')
+        if not isinstance(station_key, str) or station_key.strip() == "":
+            station_key = idx # Fallback to OSM index (which is unique in the gdf)
         else:
-            print(f"[WARN] Could not find a nearest node for EMS station '{station_name}' at ({station_lat:.4f}, {station_lng:.4f}). Skipping addition.")
+            # Handle duplicate names by appending index
+            original_key = station_key
+            counter = 1
+            while station_key in processed_names:
+                counter += 1
+                station_key = f"{original_key}_{counter}"
+            processed_names.add(station_key)
 
-    return G, ems_stations, station_nodes
+
+        # Choose centroid for non-points
+        geom = row.geometry.centroid if row.geometry.geom_type != 'Point' else row.geometry
+        x, y = geom.x, geom.y
+
+        try:
+            # Find the nearest node
+            node_id = ox.nearest_nodes(G, X=x, Y=y)
+            station_nodes[station_key] = node_id
+            # print(f"  Snapped '{station_key}' to node {node_id}") # Optional debug print
+        except Exception as e:
+            # Log error instead of silently skipping
+            print(f"[WARN] Could not snap station '{station_key}' (OSM index {idx}) at ({x:.4f}, {y:.4f}): {e}")
+            continue # Skip this station
+
+    print(f"[INFO] Successfully snapped {len(station_nodes)} stations.")
+    return station_nodes
